@@ -1,1 +1,21 @@
-attendance_system.db
+# Byte-code files
+*.pyc
+__pycache__/
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# Virtual environment
+venv/
+env/
+
+# Database files
+*.sqlite3
+*.db
+
+# Uploaded files
+uploads/
+
+# Logs
+*.log

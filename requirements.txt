@@ -1,6 +1,7 @@
-# requirements.txt
 streamlit
 pandas
+pymongo
 openpyxl
+xlrd
 xlsxwriter
-xlrd>=2.0.1
+python-dateutil
