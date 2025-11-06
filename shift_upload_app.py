@@ -22,7 +22,43 @@ def parse_time(t):
         except:
             return None
 
-def load_shift_file(file, year_month):
+def load_weekly_shift_file(file):
+    df = pd.read_excel(file)
+    df = df.fillna("")
+
+    grouped = df.groupby("Employee_ID")
+
+    for emp_id, group in grouped:
+        emp_name = group["Employee_Name"].iloc[0]
+        dept = group["Department"].iloc[0]
+
+        week_data = []
+        for _, row in group.iterrows():
+            week_data.append({
+                "day": row["Days"],
+                "shift_type": row["Shift_Type"],
+                "shift_in": row["Shift_In"],
+                "shift_out": row["Shift_Out"],
+                "crosses_midnight": row["Crosses_Midnight"],
+                "shift_duration_hours": row["Shift_Duration_Hours"],
+                "weekoff": row["Weekoff"]
+            })
+
+        db.weekly_shifts.update_one(
+            {"employee_id": str(emp_id)},
+            {
+                "$set": {
+                    "employee_id": str(emp_id),
+                    "employee_name": emp_name,
+                    "department": dept,
+                    "week_data": week_data,
+                    "uploaded_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+   
+
     df = pd.read_excel(file)
     df.columns = [c.strip().lower() for c in df.columns]
 
@@ -83,12 +119,13 @@ uploaded_file = st.file_uploader("Upload Staff Shift Excel File", type=["xlsx"])
 
 year_month = st.text_input("Enter year-month (YYYY-MM)", "")
 
-if st.button("Upload and Store Shifts"):
-    if not uploaded_file or not year_month:
-        st.error("Please upload file and enter month like 2025-07")
+if st.button("Upload and Store Weekly Shifts"):
+    if not uploaded_file:
+        st.error("Please upload the Excel file")
     else:
         try:
-            load_shift_file(uploaded_file, year_month)
-            st.success("Shift data imported successfully!")
+            load_weekly_shift_file(uploaded_file)
+            st.success("✅ Weekly shift data stored successfully in MongoDB!")
         except Exception as e:
             st.error(f"Error: {e}")
+

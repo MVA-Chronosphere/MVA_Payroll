@@ -1,7 +1,14 @@
-streamlit
-pandas
-pymongo
-openpyxl
-xlrd
-xlsxwriter
-python-dateutil
+# --- Core Framework ---
+streamlit==1.39.0          # Main dashboard & UI framework
+
+# --- Data Processing ---
+pandas==2.2.3              # Excel data parsing & manipulation
+openpyxl==3.1.5            # For reading .xlsx files
+xlrd==2.0.1                # For reading legacy .xls files
+xlsxwriter==3.2.0          # For generating downloadable Excel summaries
+
+# --- Database ---
+pymongo==4.10.1            # MongoDB driver for Python
+
+# --- Utilities ---
+python-dateutil==2.9.0     # Date and time utilities used by pandas
