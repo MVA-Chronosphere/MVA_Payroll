@@ -4,54 +4,131 @@ compute_monthly_payroll.py
 Final version for MVA Payroll System.
 
 ✅ Reads only monthly attendance Excel file.
-✅ Fetches shift details directly from MongoDB (`shift_master`).
-✅ Matches each employee to their assigned/default shift.
+✅ Fetches shift details from MongoDB weekly_shifts collection.
+✅ Matches each employee to their assigned shift pattern.
 ✅ Computes presence, absences, FM status automatically.
+✅ Implements new deduction rules:
+    - Compare actual IN/OUT with expected IN/OUT
+    - If hours worked < 9 hours, apply deductions
+    - Late arrival rules (6+ min for 3 days, 30+ min any day)
+    - Half-day marking
 ✅ Updates payroll summary in MongoDB.
 """
 
 import pandas as pd
 from datetime import datetime
-from mongo_helpers import get_db
 from mva import parse_mva_blocks, calculate_fm_status
+from pymongo import MongoClient
 
 
-AUTO_UPDATE_EMPLOYEES = True   # Automatically update employee info
+AUTO_UPDATE_EMPLOYEES = False   # Automatically update employee info
 SYNC_EMPLOYEES = False         # Set True to remove employees missing in this import
 
 
-def compute_monthly_payroll(attendance_file):
+def compute_monthly_payroll(attendance_file, timetable_file=None):
     print(f"📘 Loading attendance file: {attendance_file}")
+    if timetable_file:
+        print(f"📘 Loading timetable file: {timetable_file}")
+
+    # Connect to MongoDB
+    mongo_client = MongoClient("mongodb://localhost:27017/")
+    db = mongo_client["mva_payroll"]
+    payroll_collection = db["monthly_payroll_summary"]
 
     # --- Read attendance file ---
     att_df = pd.read_excel(attendance_file, header=None)
-    db = get_db()
-    payroll_coll = db["monthly_payroll_summary"]
-    employees_coll = db["employees"]
-    shift_coll = db["shift_master"]
-    assign_coll = db["employee_shift_assignments"]
 
     # --- Parse attendance blocks ---
     blocks = parse_mva_blocks(att_df)
     print(f"🔍 Parsed {len(blocks)} employee attendance blocks.")
 
-    # --- Prepare shift lookup from DB ---
-    shifts = list(shift_coll.find({}))
-    shift_lookup = {s["shift_code"]: s for s in shifts}
-
-    # --- Prepare employee-to-shift mapping ---
-    emp_shift_map = {}
-    for emp in employees_coll.find({}, {"_id": 0, "employee_id": 1, "default_shift": 1}):
-        emp_shift_map[str(emp["employee_id"]).strip()] = emp.get("default_shift")
-
-    # Optionally remove employees missing in this attendance file
-    if SYNC_EMPLOYEES:
-        imported_ids = {str(b.get("empcode", "")).strip() for b in blocks if b.get("empcode")}
-        existing_ids = {e["employee_id"] for e in employees_coll.find({}, {"employee_id": 1})}
-        to_remove = existing_ids - imported_ids
-        if to_remove:
-            res = employees_coll.delete_many({"employee_id": {"$in": list(to_remove)}})
-            print(f"🗑️ Removed {res.deleted_count} employees not present in this import.")
+    # If a timetable file is provided, read it to get expected IN/OUT times
+    timetable_data = {}
+    if timetable_file:
+        try:
+            # Read the timetable Excel file
+            timetable_df = pd.read_excel(timetable_file)
+            
+            # Process the timetable data to extract expected IN/OUT times for each employee and day
+            # Assuming the timetable follows the same format as the generated one
+            # with IN/OUT rows and date columns
+            
+            # Find the IN and OUT rows by looking for cells that start with "IN" or "OUT"
+            in_row_idx = None
+            out_row_idx = None
+            work_row_idx = None
+            status_row_idx = None
+            
+            for idx, row in timetable_df.iterrows():
+                first_cell = str(row.iloc[0]).upper() if pd.notna(row.iloc[0]) else ""
+                if first_cell.startswith("IN"):
+                    in_row_idx = idx
+                elif first_cell.startswith("OUT"):
+                    out_row_idx = idx
+                elif first_cell.startswith("WORK"):
+                    work_row_idx = idx
+                elif "STATUS" in first_cell:
+                    status_row_idx = idx
+            
+            # Extract date columns (assuming they start from column 1, with dates in row 1 or 2)
+            date_cols = []
+            day_row_idx = in_row_idx - 1  # Day names are typically one row above IN
+            if day_row_idx >= 0:
+                day_row = timetable_df.iloc[day_row_idx]
+                for col_idx in range(1, len(day_row)):  # Skip first column which is usually "IN", "OUT", etc.
+                    date_val = day_row.iloc[col_idx]
+                    if pd.notna(date_val) and str(date_val).strip().isdigit():
+                        day_num = int(float(str(date_val).strip()))
+                        if 1 <= day_num <= 31:
+                            date_cols.append((col_idx, day_num))
+            
+            # Process each employee's data in the timetable
+            emp_start_idx = 0
+            for idx, row in timetable_df.iterrows():
+                empcode_cell = str(row.iloc[1]).strip() if len(row) > 1 else ""  # Column B (index 1) has employee code
+                if "EMPCODE" in empcode_cell.upper() or len(empcode_cell) > 0:
+                    # Check if this looks like an employee header row
+                    if any("EMPCODE" in str(cell).upper() for cell in row) or len(empcode_cell) > 0:
+                        # Get employee ID and name from this block
+                        emp_id = ""
+                        emp_name = ""
+                        
+                        # Look for the row with the actual employee code and name
+                        if "EMPCODE" in empcode_cell.upper():
+                            # This is the header row, actual values are in the next row
+                            if idx + 1 < len(timetable_df):
+                                next_row = timetable_df.iloc[idx + 1]
+                                emp_id = str(next_row.iloc[1]).strip() if len(next_row) > 1 else ""
+                                emp_name = str(next_row.iloc[4]).strip() if len(next_row) > 4 else ""
+                        else:
+                            # This row has the actual values
+                            emp_id = empcode_cell
+                            emp_name = str(row.iloc[4]).strip() if len(row) > 4 else ""
+                        
+                        if emp_id and emp_id != "EMPCODE":
+                            # Extract IN/OUT times for each day for this employee
+                            emp_timetable = {}
+                            for col_idx, day_num in date_cols:
+                                expected_in = ""
+                                expected_out = ""
+                                
+                                if in_row_idx is not None and col_idx < len(timetable_df.columns):
+                                    expected_in_val = timetable_df.iloc[in_row_idx, col_idx]
+                                    expected_in = str(expected_in_val).strip() if pd.notna(expected_in_val) else ""
+                                
+                                if out_row_idx is not None and col_idx < len(timetable_df.columns):
+                                    expected_out_val = timetable_df.iloc[out_row_idx, col_idx]
+                                    expected_out = str(expected_out_val).strip() if pd.notna(expected_out_val) else ""
+                                
+                                # Store expected times for this day
+                                emp_timetable[day_num] = {
+                                    "expected_in": expected_in,
+                                    "expected_out": expected_out
+                                }
+                            
+                            timetable_data[emp_id] = emp_timetable
+        except Exception as e:
+            print(f"⚠️ Error reading timetable file: {e}")
 
     computed = 0
 
@@ -64,23 +141,8 @@ def compute_monthly_payroll(attendance_file):
         if not emp_id:
             continue
 
-        # --- Determine shift ---
-        assigned_shift = assign_coll.find_one({"employee_id": emp_id})
-        shift_code = (
-            assigned_shift.get("shift_code")
-            if assigned_shift
-            else emp_shift_map.get(emp_id)
-        )
-        shift_info = shift_lookup.get(shift_code, {})
-
-        shift_in = ""
-        shift_out = ""
-        shift_type = shift_code or "N/A"
-        role_type = shift_info.get("description", "").lower()  # detect 'split' role
-        if shift_info and "intervals" in shift_info and shift_info["intervals"]:
-            primary = shift_info["intervals"][0]
-            shift_in = primary.get("start", "")
-            shift_out = primary.get("end", "")
+        # Get expected shift times from the uploaded timetable if available
+        expected_shifts = timetable_data.get(emp_id, {})
 
         # --- Attendance metrics ---
         daily = b.get("daily", [])
@@ -93,11 +155,12 @@ def compute_monthly_payroll(attendance_file):
         absents = sum(1 for s in statuses if s in ("A", "AB", "ABSENT"))
         total_working_days = len(statuses)
 
-        # --- Additional Payroll Rules ---
+        # --- Payroll Deduction Rules ---
         total_quarter_cut_days = 0  # ¼-day salary cuts
-        total_late_entries = 0      # Late >5min but ≤30min count
+        late_arrival_days = []      # Track days with late arrivals >6 min
 
         for day_data in daily:
+            day_num = day_data.get("day")
             in_time = day_data.get("in_time", "").strip()
             out_time = day_data.get("out_time", "").strip()
             status = (day_data.get("status", "") or "").strip().upper()
@@ -105,39 +168,71 @@ def compute_monthly_payroll(attendance_file):
             if not in_time or not out_time or status not in ("P", "PR", "W", "WD"):
                 continue
 
+            # Get expected shift times for this day from the uploaded timetable
+            expected_times = expected_shifts.get(day_num, {})
+            expected_in = expected_times.get("expected_in", "")
+            expected_out = expected_times.get("expected_out", "")
+
+            # Skip if expected times are not available
+            if not expected_in or not expected_out or expected_in == "--:--" or expected_out == "--:--":
+                continue
+
             try:
                 fmt = "%H:%M"
                 in_dt = datetime.strptime(in_time, fmt)
                 out_dt = datetime.strptime(out_time, fmt)
+                expected_in_dt = datetime.strptime(expected_in, fmt)
+                expected_out_dt = datetime.strptime(expected_out, fmt)
 
-                # Handle overnight
+                # Handle overnight shifts
                 if out_dt < in_dt:
                     out_dt = out_dt.replace(day=in_dt.day + 1)
+                if expected_out_dt < expected_in_dt:
+                    expected_out_dt = expected_out_dt.replace(day=expected_in_dt.day + 1)
 
-                worked_hours = (out_dt - in_dt).total_seconds() / 3600
+                # Calculate actual and expected working hours
+                actual_worked_seconds = (out_dt - in_dt).total_seconds()
+                expected_worked_seconds = (expected_out_dt - expected_in_dt).total_seconds()
+                
+                # Subtract break time (if any is configured)
+                # For now, assuming no break time is configured, but we can make it configurable
+                break_time_seconds = 0 # This could be read from shift details if configured
+                
+                actual_worked_hours = (actual_worked_seconds - break_time_seconds) / 3600
+                expected_worked_hours = (expected_worked_seconds - break_time_seconds) / 3600
 
-                # Handle split shifts: must work >= 9 hours total
-                if "split" in role_type and worked_hours < 9:
-                    total_quarter_cut_days += 0.25  # less than 9 hrs → deduct ¼
-                    continue
-
-                # --- Late arrival checks ---
-                expected_in = datetime.strptime(shift_in, fmt) if shift_in else None
-                if expected_in:
-                    late_mins = (in_dt - expected_in).total_seconds() / 60
-                    if late_mins > 30:
-                        # More than 30 mins late → direct ¼-day cut
+                # Check if hours worked is less than expected
+                if actual_worked_hours < expected_worked_hours:
+                    # Apply deduction based on how much less was worked
+                    hour_difference = expected_worked_hours - actual_worked_hours
+                    if hour_difference >= 6:  # More than 6 hours short: full day deduction
+                        total_quarter_cut_days += 1.0
+                    elif hour_difference >= 4.5:  # 4.5-6 hours short: 3/4 day deduction
+                        total_quarter_cut_days += 0.75
+                    elif hour_difference >= 3:  # 3-4.5 hours short: half day deduction
+                        total_quarter_cut_days += 0.5
+                    elif hour_difference > 0:  # Less than 3 hours short: quarter day deduction
                         total_quarter_cut_days += 0.25
-                    elif late_mins > 5:
-                        # More than 5 mins late (within 30 mins) → track count
-                        total_late_entries += 1
+
+                # Check for late arrival (more than 6 minutes after expected IN time)
+                late_minutes = (in_dt - expected_in_dt).total_seconds() / 60
+                if late_minutes > 6 and late_minutes <= 30:
+                    late_arrival_days.append(day_num)
+                elif late_minutes > 30:
+                    # If late by more than 30 minutes, apply quarter-day deduction immediately
+                    total_quarter_cut_days += 0.25
 
             except Exception as e:
                 # Ignore parsing errors safely
+                print(f"⚠️ Error processing day {day_num} for employee {emp_id}: {e}")
                 continue
 
-        # For every 3 late entries (>5min), apply 1 quarter-day cut
-        total_quarter_cut_days += (total_late_entries // 3) * 0.25
+        # Apply late arrival deductions: every 3rd late arrival (>6 min) results in a quarter-day deduction
+        # (Not necessarily consecutive days)
+        if len(late_arrival_days) >= 3:
+            # For every 3 late days, apply 1 quarter-day deduction
+            late_deductions = len(late_arrival_days) // 3
+            total_quarter_cut_days += late_deductions * 0.25
 
         # --- Compute FM status ---
         fm_status = calculate_fm_status(
@@ -150,6 +245,11 @@ def compute_monthly_payroll(attendance_file):
             fm_status = f"{fm_status} -{round(total_quarter_cut_days, 2)}"
 
         # --- Save result ---
+        # Ensure expected_in and expected_out are defined even if not found in timetable
+        if 'expected_in' not in locals() or 'expected_out' not in locals():
+            expected_in = "N/A"
+            expected_out = "N/A"
+        
         doc = {
             "employee_id": emp_id,
             "employee_name": name,
@@ -163,35 +263,65 @@ def compute_monthly_payroll(attendance_file):
             "total_working_days": total_working_days,
             "full_month_status": fm_status,
             "quarter_day_cuts": round(total_quarter_cut_days, 2),
-            "late_count": total_late_entries,
-            "shift_type": shift_type,
-            "shift_in": shift_in,
-            "shift_out": shift_out,
-            "computed_at": datetime.utcnow()
+            "late_count": len(late_arrival_days),
+            "shift_type": "N/A",  # Will be updated if we have shift data
+            "shift_in": expected_in,
+            "shift_out": expected_out,
+            "computed_at": datetime.utcnow().isoformat()
         }
 
-        payroll_coll.update_one(
+        # Insert or update the document in MongoDB
+        payroll_collection.replace_one(
             {"employee_id": emp_id, "month": month},
-            {"$set": doc},
+            doc,
             upsert=True
         )
 
-        if AUTO_UPDATE_EMPLOYEES:
-            employees_coll.update_one(
-                {"employee_id": emp_id},
-                {"$set": {
-                    "name": name,
+        # Store daily attendance records in MongoDB as well
+        for day_data in b.get("daily", []):
+            day_num = day_data.get("day")
+            if day_num:
+                daily_doc = {
+                    "employee_id": emp_id,
+                    "employee_name": name,
                     "department": dept,
-                    "default_shift": shift_code,
-                    "shift_in": shift_in,
-                    "shift_out": shift_out,
-                    "updated_at": datetime.utcnow()
-                }},
+                    "month": month,
+                    "day": day_num,
+                    "weekday": day_data.get("weekday", ""),
+                    "in_time": day_data.get("in_time", ""),
+                    "out_time": day_data.get("out_time", ""),
+                    "work_time": day_data.get("work_time", ""),
+                    "status": day_data.get("status", ""),
+                    "computed_at": datetime.utcnow().isoformat()
+                }
+                
+                # Check if this daily record exists, if so update it, otherwise insert new
+                db.attendance_daily.replace_one(
+                    {"employee_id": emp_id, "day": day_num, "month": month},
+                    daily_doc,
+                    upsert=True
+                )
+
+        if AUTO_UPDATE_EMPLOYEES:
+            # Update employee info in MongoDB if needed
+            db.employees.update_one(
+                {"employee_id": emp_id},
+                {
+                    "$set": {
+                        "name": name,
+                        "department": dept,
+                        "default_shift": "N/A",
+                        "shift_in": expected_in,
+                        "shift_out": expected_out,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }
+                },
                 upsert=True
             )
 
         computed += 1
 
+    mongo_client.close()
 
     print(f"✅ Computed payroll for {computed} employees.")
     print("📦 Saved to MongoDB collection: monthly_payroll_summary")
@@ -201,5 +331,10 @@ def compute_monthly_payroll(attendance_file):
 
 # Optional direct run for testing
 if __name__ == "__main__":
-    attendance_path = "monthperformance05112025114624.xlsx"
-    compute_monthly_payroll(attendance_path)
+    # Find the latest attendance file
+    import glob
+    import os
+    list_of_files = glob.glob('attendance_*.xlsx') # * means all if need specific format then *.xlsx
+    latest_file = max(list_of_files, key=os.path.getctime)
+    print(f"Processing latest attendance file: {latest_file}")
+    compute_monthly_payroll(latest_file)

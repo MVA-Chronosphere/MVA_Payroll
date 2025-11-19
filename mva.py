@@ -40,10 +40,53 @@ def parse_mva_blocks(df: pd.DataFrame) -> list:
             empcode = find_label_value(header_row, ["empcode"])
             name = find_label_value(header_row, ["name"])
             dept = find_label_value(header_row, ["deptname", "dept name", "department"])
+            
+            # Try multiple approaches to find the month
             month = find_label_value(header_row, ["reportmonth", "report month"])
             if not month and i+1 < nrows:
                 srow = df.iloc[i+1].tolist()
                 month = find_label_value(srow, ["reportmonth", "report month"])
+            
+            # If month still not found, try looking for other common month patterns in nearby rows
+            if not month:
+                # Look in a few rows above and below for month information
+                for check_row_idx in [i-2, i-1, i+1, i+2]:
+                    if 0 <= check_row_idx < nrows:
+                        check_row = df.iloc[check_row_idx].tolist()
+                        check_row_str = " ".join([to_clean_str(x) for x in check_row])
+                        
+                        # Look for month names in the row
+                        import re
+                        month_pattern = r'(january|february|march|april|may|june|july|august|september|october|november|december)'
+                        month_match = re.search(month_pattern, check_row_str.lower())
+                        if month_match:
+                            found_month = month_match.group(1).capitalize()
+                            # Try to find the year as well
+                            year_pattern = r'\b(20\d{2})\b'
+                            year_match = re.search(year_pattern, check_row_str)
+                            if year_match:
+                                month = f"{found_month}-{year_match.group(1)}"
+                            else:
+                                month = found_month
+                            break
+                
+                # If still no month, try looking for date patterns like "Month Year" in the entire header area
+                if not month:
+                    for check_row_idx in range(max(0, i-3), min(nrows, i+5)):
+                        check_row = df.iloc[check_row_idx].tolist()
+                        for cell in check_row:
+                            cell_str = to_clean_str(cell)
+                            # Look for patterns like "November 2024", "Nov 2024", etc.
+                            date_pattern = r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(20\d{2})'
+                            date_match = re.search(date_pattern, cell_str.lower())
+                            if date_match:
+                                month_name = date_match.group(1).capitalize()
+                                year = date_match.group(2)
+                                month = f"{month_name}-{year}"
+                                break
+                        if month:
+                            break
+            
             srow = df.iloc[i+1].tolist() if i+1 < nrows else [""]*ncols
             present = to_clean_str(find_label_value(srow, ["present"]))
             wo = to_clean_str(find_label_value(srow, ["wo", "weekly off"]))
@@ -133,13 +176,10 @@ def parse_mva_blocks(df: pd.DataFrame) -> list:
     return blocks
 
 def calculate_fm_status(present_days, half_days, leaves, absent_days, week_offs, total_working_days):
-    if (present_days >= 27 and week_offs == 4 and half_days == 0 and leaves == 0 and absent_days == 0) or \
-       (present_days == 31 and half_days == 0 and leaves == 0 and absent_days == 0):
-        return "FM+1"
     working_days = total_working_days - week_offs
     total_attendance = present_days + (half_days * 0.5) + leaves
     if present_days == working_days and half_days == 0 and leaves == 0 and absent_days == 0:
-        return "FM+1"
+        return "FM"
     if absent_days == 1 and leaves == 0:
         return "FM"
     if absent_days == 0 and leaves == 1:

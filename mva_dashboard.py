@@ -11,13 +11,15 @@ from mongo_helpers import get_db
 
 
 # ======================================================
-# 1️⃣ DATABASE CONNECTION
+# 1️⃣ DATABASE INITIALIZATION & CONNECTION
 # ======================================================
+# --- MongoDB Connection ---
 client = MongoClient("mongodb://localhost:27017/")
 db = client["mva_payroll"]
-employees_coll = db["employees"]
 payroll_coll = db["monthly_payroll_summary"]
 shift_coll = db["shift_master"]
+weekly_shifts_coll = db["weekly_shifts"]
+employees_coll = db["employees"]
 
 # ======================================================
 # 2️⃣ STREAMLIT CONFIG
@@ -34,7 +36,7 @@ st.set_page_config(
 st.sidebar.title("📊 MVA Payroll System")
 page = st.sidebar.radio(
     "Navigate to",
-    ["🏠 Dashboard", "📤 Upload Monthly Attendance", "👥 Employees"],
+    ["🏠 Dashboard", "📤 Upload Monthly Attendance", "👥 Employee Management"],
 )
 
 # ======================================================
@@ -43,38 +45,46 @@ page = st.sidebar.radio(
 if page == "🏠 Dashboard":
     st.title("🏠 Payroll Overview Dashboard")
 
-    # Fetch most recent payroll record
-    latest_doc = payroll_coll.find_one(sort=[("_id", -1)])
-    if not latest_doc:
+    # Fetch all unique months from the database
+    all_months = list(payroll_coll.distinct("month"))
+    # Filter out empty month values and sort in descending order (most recent first)
+    all_months = [month for month in all_months if month and month.strip() != ""]
+    all_months.sort(reverse=True)
+    
+    if not all_months:
         st.info("No payroll data found yet. Please upload attendance to generate payroll.")
     else:
-        latest_month = latest_doc.get("month", "Unknown")
-        st.markdown(f"### 📅 Latest Computed Month: **{latest_month}**")
+        # Month selection dropdown
+        selected_month = st.selectbox(
+            "📅 Select Month to View Payroll Data",
+            options=all_months,
+            index=0
+        )
+        
+        st.markdown(f"### 📅 Selected Month: **{selected_month}**")
 
-        # Fetch all payroll records for that month
-        month_records = list(payroll_coll.find({"month": latest_month}, {"_id": 0}))
+        # Fetch all payroll records for the selected month
+        month_records = list(payroll_coll.find({"month": selected_month}, {"_id": 0}))
         if not month_records:
-            st.warning("No records found for the latest month.")
+            st.warning(f"No records found for the month: {selected_month}")
         else:
             df = pd.DataFrame(month_records)
             total_employees = len(df)
             st.metric("👥 Employees Processed", total_employees)
 
             # Summary metrics
-            fm_plus = df[df["full_month_status"] == "FM+1"].shape[0]
             fm = df[df["full_month_status"] == "FM"].shape[0]
             fm_minus = df[df["full_month_status"].str.startswith("FM-")].shape[0]
             half_month = df[df["half_days"] > 0].shape[0]
             total_absent = df["absent_days"].sum()
             total_leave = df["leaves"].sum()
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("✅ FM+1", fm_plus)
-            c2.metric("💼 FM", fm)
-            c3.metric("⚠️ Partial (FM–x)", fm_minus)
-            c4.metric("🌓 Half Month", half_month)
-            c5.metric("🚫 Absents", total_absent)
-            c6.metric("🏖️ Leaves", total_leave)
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("💼 FM", fm)
+            c2.metric("⚠️ Partial (FM–x)", fm_minus)
+            c3.metric("🌓 Half Month", half_month)
+            c4.metric("🚫 Absents", total_absent)
+            c5.metric("🏖️ Leaves", total_leave)
 
            # --- Visualization ---
             st.divider()
@@ -142,7 +152,7 @@ if page == "🏠 Dashboard":
             st.download_button(
                 label="📥 Download Payroll (Excel)",
                 data=excel_buffer,
-                file_name=f"Payroll_{latest_month}.xlsx",
+                file_name=f"Payroll_{selected_month}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
@@ -152,182 +162,362 @@ if page == "🏠 Dashboard":
 elif page == "📤 Upload Monthly Attendance":
     st.title("📤 Upload Monthly Attendance")
 
-    st.markdown("""
-    ### 🧾 Instructions:
-    1. Select or confirm the **Payroll Month** from the dropdown.
-    2. Upload the **Monthly Attendance Excel** file (e.g., `monthperformance...xlsx`).
-    3. Shift details are fetched automatically from MongoDB (`shift_master`).
-    4. The computed payroll will be saved to the database and visible on the dashboard.
-    """)
+    # --- Download Timetable Section ---
+    st.subheader("📥 Download Timetable Template")
+    st.markdown("Download a timetable template with default shift times for the selected month:")
 
-    # --- Fetch existing months from DB ---
-    db = get_db()
-    existing_months = (
-        db["monthly_payroll_summary"]
-        .distinct("report_month")
-    )
-    existing_months = sorted([m for m in existing_months if m], reverse=True)
-
-    # --- Month selection dropdown ---
+    # Month selection for the template
     current_year = datetime.now().year
     month_options = [
         f"{current_year}-{m:02d}" for m in range(1, 13)
     ][::-1]  # show recent first
-
-    default_month = existing_months[0] if existing_months else month_options[0]
-
-    selected_month = st.selectbox(
-        "📅 Select or Confirm Payroll Month",
+    
+    template_month = st.selectbox(
+        "📅 Select Month for Template",
         options=month_options,
-        index=month_options.index(default_month)
-        if default_month in month_options else 0
+        index=0  # default to current or previous month
     )
 
-    st.caption("If the uploaded Excel includes 'Report Month', it will override this selection automatically.")
+    if st.button("📥 Generate and Download Timetable"):
+        with st.spinner("⏳ Generating timetable template..."):
+            try:
+                import calendar
+                import math
+                from io import BytesIO
+                import xlsxwriter
+                from datetime import datetime
+                import os
 
-    # --- File uploader ---
+                # Parse selected month
+                year, month = map(int, template_month.split('-'))
+                month_name = calendar.month_name[month]
+                num_days = calendar.monthrange(year, month)[1]
+
+                # Use the updated timetable.py to generate a CSV first
+                from timetable import generate_timetable
+                generate_timetable(month, year)
+                
+                # Load the generated CSV to create the Excel template
+                timetable_file = f"timetable_{year}_{str(month).zfill(2)}.csv"
+                if not os.path.exists(timetable_file):
+                    st.warning("No timetable file generated.")
+                    st.stop()
+                
+                df_timetable = pd.read_csv(timetable_file)
+                
+                # Create Excel file in memory
+                excel_buffer = BytesIO()
+                workbook = xlsxwriter.Workbook(excel_buffer, {'in_memory': True})
+                worksheet = workbook.add_worksheet(f"{month_name}_{year}")
+
+                # --- Define Formats ---
+                header_format = workbook.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'border': 1})
+                cell_format = workbook.add_format({'align': 'center', 'border': 1})
+                emp_info_format = workbook.add_format({'bold': True, 'align': 'left'})
+
+                # --- Write Headers ---
+                worksheet.merge_range('D1:F1', 'MACRO VISION ACADEMY', header_format)
+                worksheet.write('H1', 'Report Month', header_format)
+                worksheet.write('I1', f"{month_name}-{year}", header_format)
+
+                # --- Main Loop for Each Employee (from the generated timetable) ---
+                current_row = 3
+                for idx, emp_row in df_timetable.iterrows():
+                    # --- Employee Info Header ---
+                    worksheet.write(f'A{current_row}', 'Dept. Name', emp_info_format)
+                    worksheet.write(f'B{current_row}', emp_row.get("department", "Default"))
+                    worksheet.write(f'A{current_row + 1}', 'Empcode', emp_info_format)
+                    worksheet.write(f'B{current_row + 1}', emp_row.get("employee_id", "0000"))
+                    worksheet.write(f'D{current_row + 1}', 'Name', emp_info_format)
+                    worksheet.write(f'E{current_row + 1}', emp_row.get("name", "Default"))
+
+                    # --- Date and Day Rows ---
+                    date_row = current_row + 2
+                    day_row = current_row + 3
+                    
+                    worksheet.write(f'A{date_row}', '') # Empty cell before dates
+                    worksheet.write(f'A{day_row}', '') # Empty cell before days
+
+                    for day in range(1, num_days + 1):
+                        # Date Number
+                        worksheet.write(date_row, day, str(day), header_format)
+                        # Day Name
+                        date_obj = datetime(year, month, day)
+                        day_name = date_obj.strftime('%a')
+                        worksheet.write(day_row, day, day_name, header_format)
+
+                    # --- Data Rows (IN, OUT, etc.) ---
+                    data_labels = ["IN", "OUT", "Status"]
+                    data_start_row = current_row + 4
+
+                    for i, label in enumerate(data_labels):
+                        row_num = data_start_row + i
+                        worksheet.write(row_num, 0, label, header_format) # Write label in first column
+                        
+                        for day_col in range(1, num_days + 1):
+                            date_obj = datetime(year, month, day_col)
+                            current_day_name = date_obj.strftime('%A').lower() # e.g., "tuesday"
+
+                            content = ""
+                            # Get the shift details from the timetable data
+                            date_key = f"{day_col:02d}-{date_obj.strftime('%a')}"  # e.g., "01-Mon"
+                            shift_info = emp_row.get(date_key, "--:-- to --:-- (Off)")
+                            
+                            if label == "IN":
+                                # Extract IN time from the shift_info string (e.g., "09:30 to 18:30 (General)")
+                                try:
+                                    in_out = shift_info.split(" to ")
+                                    in_time = in_out[0] if in_out else "--:--"
+                                    # Further split to remove shift type if needed
+                                    in_time = in_time.split(" (")[0] if " (" in in_time else in_time
+                                    content = in_time
+                                except:
+                                    content = "--:--"
+                            elif label == "OUT":
+                                # Extract OUT time from the shift_info string
+                                try:
+                                    in_out = shift_info.split(" to ")
+                                    out_with_type = in_out[1] if len(in_out) > 1 else "--:--"
+                                    # Remove shift type in parentheses
+                                    out_time = out_with_type.split(" (")[0] if " (" in out_with_type else out_with_type
+                                    content = out_time
+                                except:
+                                    content = "--:--"
+                            elif label == "Status":
+                                content = "A"  # Default to Absent, will be filled by user
+
+                            # Final check for empty or invalid content
+                            if content is None or (isinstance(content, float) and math.isnan(content)):
+                                content = "--:--"
+                                
+                            worksheet.write(row_num, day_col, content, cell_format)
+                    
+                    # Move to the next employee block
+                    current_row += len(data_labels) + 4 # 4 for header rows + space
+
+                workbook.close()
+                excel_buffer.seek(0)
+
+                st.download_button(
+                    label="✅ Click to Download Timetable",
+                    data=excel_buffer,
+                    file_name=f"timetable_template_{template_month}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                st.success(f"✅ Timetable template for {template_month} generated successfully!")
+
+            except Exception as e:
+                st.error(f"❌ Error generating timetable template: {e}")
+
+    st.divider()
+
+    # --- Payroll Calculation Section ---
+    st.subheader("🧮 Calculate Payroll")
+    st.markdown("Upload both your monthly timetable and attendance file to calculate payroll:")
+
+    # --- File uploaders ---
+    timetable_file = st.file_uploader(
+        "📅 Upload Monthly Timetable File (.xls / .xlsx)",
+        type=["xls", "xlsx"],
+        key="timetable_upload"
+    )
+    
     attendance_file = st.file_uploader(
         "📂 Upload Monthly Attendance File (.xls / .xlsx)",
-        type=["xls", "xlsx"]
+        type=["xls", "xlsx"],
+        key="attendance_upload"
     )
 
     # --- Process Payroll Button ---
     if st.button("🧮 Process Payroll"):
-        if not attendance_file:
-            st.error("Please upload the attendance file first.")
+        if not timetable_file or not attendance_file:
+            st.error("Please upload both the timetable and attendance files.")
         else:
             with st.spinner("⏳ Processing payroll... Please wait..."):
                 try:
-                    att_path = f"uploads/attendance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                    with open(att_path, "wb") as f:
+                    # Save uploaded files temporarily
+                    import os
+                    timetable_path = f"uploads/timetable_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    attendance_path = f"uploads/attendance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                    
+                    os.makedirs("uploads", exist_ok=True)
+                    
+                    with open(timetable_path, "wb") as f:
+                        f.write(timetable_file.read())
+                    
+                    with open(attendance_path, "wb") as f:
                         f.write(attendance_file.read())
 
-                    # Pass selected month hint into function
-                    result = compute_monthly_payroll(att_path)
+                    # Process the payroll with both files
+                    result = compute_monthly_payroll(attendance_path, timetable_path)
 
                     st.success(f"✅ Payroll computed successfully for {result['processed']} employees!")
-
-                    if "month" in result:
-                        st.info(f"📅 Computed for month: **{result['month']}**")
-                    else:
-                        st.warning(f"⚠️ Could not auto-detect month; used selected month: {selected_month}")
+                    st.info("📊 Check the Dashboard page for results.")
 
                     # Auto-refresh dashboard
-                    st.info("🔄 Updating dashboard...")
                     st.rerun()
 
                 except Exception as e:
                     st.error(f"❌ Error during computation: {e}")
 
-
 # ======================================================
-# 6️⃣ 👥 EMPLOYEE MANAGEMENT PAGE (with delete option)
+# 6️⃣ 👥 EMPLOYEE MANAGEMENT PAGE
 # ======================================================
-elif page == "👥 Employees":
-    st.title("👥 Employee Management")
-
-    # Upload Excel
-    st.subheader("📤 Bulk Upload Employees")
-    emp_file = st.file_uploader("Upload Employee Excel (.xls / .xlsx)", type=["xls", "xlsx"])
-
-    if emp_file:
+elif page == "👥 Employee Management":
+    st.title("👥 Employee & Shift Management")
+    
+    # Define helper functions
+    def parse_time(t):
+        """Convert time string to HH:MM 24hr"""
+        if pd.isna(t) or t == "":
+            return None
         try:
-            df = pd.read_excel(emp_file)
-            required_cols = ["Employee_ID", "Employee_Name", "Department"]
-            if not all(col in df.columns for col in required_cols):
-                st.error(f"Excel must contain columns: {required_cols}")
-            else:
-                inserted = 0
-                for _, row in df.iterrows():
-                    emp_id = str(row["Employee_ID"]).strip()
-                    name = str(row["Employee_Name"]).strip()
-                    dept = str(row.get("Department", "")).strip()
-                    shift_type = str(row.get("Shift_Type", "")).strip()
-                    shift_in = str(row.get("Shift_In", "")).strip()
-                    shift_out = str(row.get("Shift_Out", "")).strip()
-                    weekoff = str(row.get("Weekoff", "")).strip()
+            t = str(t).strip()
+            return datetime.strptime(t, "%I:%M %p").strftime("%H:%M")
+        except:
+            try:
+                return datetime.strptime(t, "%H:%M").strftime("%H:%M")
+            except:
+                return None
 
-                    employees_coll.update_one(
-                        {"employee_id": emp_id},
-                        {"$set": {
-                            "name": name,
-                            "department": dept,
-                            "shift_type": shift_type,
-                            "shift_in": shift_in,
-                            "shift_out": shift_out,
-                            "weekoff": weekoff,
-                            "updated_at": datetime.utcnow()
-                        }},
-                        upsert=True
-                    )
-                    inserted += 1
-                st.success(f"✅ Imported/updated {inserted} employees successfully!")
-        except Exception as e:
-            st.error(f"Error importing employees: {e}")
+    def load_weekly_shift_file(file):
+        """
+        Uploads master shift details for employees.
+        Expects an Excel file with columns: Employee_ID, Employee_Name, Department, Days, Shift_Type, Shift_In, Shift_Out, Crosses_Midnight, Shift_Duration_Hours, Weekoff
+        """
+        df = pd.read_excel(file)
+        df = df.fillna("")
 
-    st.divider()
+        # Group by Employee_ID to handle multiple rows per employee (one per day/shift type)
+        grouped = df.groupby("Employee_ID")
 
-    # Manual Add
-    st.subheader("➕ Add Employee Manually")
-    with st.form("add_emp_form"):
-        col1, col2, col3 = st.columns(3)
-        emp_id = col1.text_input("Employee ID")
-        name = col2.text_input("Employee Name")
-        dept = col3.text_input("Department")
+        for emp_id, group in grouped:
+            emp_name = group["Employee_Name"].iloc[0]
+            dept = group["Department"].iloc[0]
 
-        col4, col5, col6 = st.columns(3)
-        shift_type = col4.text_input("Shift Type")
-        shift_in = col5.text_input("Shift In (HH:MM)")
-        shift_out = col6.text_input("Shift Out (HH:MM)")
+            week_data = []
+            for _, row in group.iterrows():
+                week_data.append({
+                    "day": row["Days"],
+                    "shift_type": row["Shift_Type"],
+                    "shift_in": row["Shift_In"],
+                    "shift_out": row["Shift_Out"],
+                    "crosses_midnight": row["Crosses_Midnight"],
+                    "shift_duration_hours": row["Shift_Duration_Hours"],
+                    "weekoff": row["Weekoff"]
+                })
 
-        weekoff = st.text_input("Weekly Off", value="Sunday")
-        submit = st.form_submit_button("💾 Save Employee")
-
-        if submit:
-            if emp_id and name:
-                employees_coll.update_one(
-                    {"employee_id": emp_id},
-                    {"$set": {
-                        "name": name,
+            # Store the weekly shift data for this employee in MongoDB
+            db.weekly_shifts.update_one(
+                {"employee_id": str(emp_id)},
+                {
+                    "$set": {
+                        "employee_id": str(emp_id),
+                        "employee_name": emp_name,
                         "department": dept,
-                        "shift_type": shift_type,
-                        "shift_in": shift_in,
-                        "shift_out": shift_out,
-                        "weekoff": weekoff,
-                        "updated_at": datetime.utcnow()
-                    }},
-                    upsert=True
-                )
-                st.success("✅ Employee added/updated successfully!")
-                st.rerun()
+                        "week_data": week_data,
+                        "uploaded_at": datetime.utcnow()
+                    }
+                },
+                upsert=True
+            )
 
+        return True
+
+    def add_employee(emp_id, name, department):
+        """Add a new employee to MongoDB"""
+        # Check if employee already exists
+        existing_employee = db.employees.find_one({"employee_id": emp_id})
+        if existing_employee:
+            return False, "Employee ID already exists"
+        
+        # Insert new employee
+        employee_doc = {
+            "employee_id": emp_id,
+            "name": name,
+            "department": department,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        result = db.employees.insert_one(employee_doc)
+        return True, "Employee added successfully"
+
+    def delete_employee(emp_id):
+        """Delete an employee from MongoDB"""
+        result = db.employees.delete_one({"employee_id": emp_id})
+        
+        if result.deleted_count > 0:
+            # Also delete from MongoDB if needed
+            db.weekly_shifts.delete_one({"employee_id": str(emp_id)})
+            return True, "Employee deleted successfully"
+        else:
+            return False, "Employee not found"
+
+    def get_all_employees():
+        """Get all employees from MongoDB"""
+        employees = list(db.employees.find({}))
+        return employees
+
+    # Create tabs for different functionalities
+    tab1, tab2, tab3 = st.tabs(["Add Employee", "Delete Employee", "Upload Shifts"])
+
+    with tab1:
+        st.header("Add New Employee")
+        new_emp_id = st.text_input("Employee ID", key="new_emp_id_2")
+        new_name = st.text_input("Employee Name", key="new_name_2")
+        new_dept = st.text_input("Department", key="new_dept_2")
+        
+        if st.button("Add Employee", key="add_employee_2"):
+            if new_emp_id and new_name and new_dept:
+                success, message = add_employee(new_emp_id, new_name, new_dept)
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
             else:
-                st.error("Employee ID and Name are required.")
+                st.error("Please fill in all fields")
 
-    st.divider()
-    st.subheader("📋 All Employees")
-
-    data = list(employees_coll.find({}, {"_id": 0}))
-    if data:
-        df_emp = pd.DataFrame(data)
-        st.dataframe(df_emp, use_container_width=True)
-
-        # --- Delete Option ---
-        st.subheader("🗑️ Delete Employee")
-        emp_ids = [d.get("employee_id") for d in data if d.get("employee_id")]
-        if emp_ids:
-            emp_to_delete = st.selectbox("Select Employee to Delete", options=emp_ids)
-            confirm_delete = st.checkbox("⚠️ Confirm delete this employee permanently")
-
-            if st.button("Delete Employee"):
+    with tab2:
+        st.header("Delete Employee")
+        all_employees = get_all_employees()
+        emp_options = {f"{emp['employee_id']} - {emp['name']}": emp['employee_id'] for emp in all_employees}
+        
+        selected_emp = st.selectbox("Select Employee to Delete", options=[""] + list(emp_options.keys()), key="delete_emp_select_2")
+        
+        if selected_emp:
+            emp_to_delete = emp_options[selected_emp]
+            confirm_delete = st.checkbox("⚠️ Confirm delete this employee permanently", key="confirm_delete_2")
+            
+            if st.button("Delete Employee", key="delete_employee_btn_2"):
                 if confirm_delete:
-                    employees_coll.delete_one({"employee_id": emp_to_delete})
-                    st.success(f"✅ Employee {emp_to_delete} deleted successfully!")
-                    st.rerun()
+                    success, message = delete_employee(emp_to_delete)
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
                 else:
                     st.warning("Please confirm before deleting an employee.")
-        else:
-            st.info("No employees found in database.")
-    else:
-        st.info("No employees found yet.")
 
+    with tab3:
+        st.header("Upload Master Shift Details")
+        uploaded_file = st.file_uploader("Upload Staff Shift Excel File", type=["xlsx"])
+
+        if st.button("Upload and Store Weekly Shifts", key="upload_shifts_2"):
+            if not uploaded_file:
+                st.error("Please upload the Excel file")
+            else:
+                try:
+                    load_weekly_shift_file(uploaded_file)
+                    st.success("✅ Weekly shift data stored successfully in MongoDB!")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    # Display all employees
+    st.divider()
+    st.header("📋 All Employees")
+    employees_df = pd.DataFrame(get_all_employees())
+    if not employees_df.empty:
+        st.dataframe(employees_df, use_container_width=True)
+    else:
+        st.info("No employees found in database.")
