@@ -247,18 +247,78 @@ if page == "🏠 Dashboard":
                         daily_df = pd.DataFrame(daily_attendance)
                         
                         if not daily_df.empty:
-                            # Convert day to datetime for comparison
-                            daily_df['date'] = daily_df.apply(
-                                lambda row: pd.to_datetime(f"{vacation_start.year}-{vacation_start.month}-{row['day']}"), axis=1
-                            )
+                            # Parse selected_month to extract year and month number
+                            # Handle various formats: 2025-10, 2025-October, October-2025, October 2025, October, 10
+                            import calendar
+                            from datetime import datetime
+
+                            sm = str(selected_month).strip()
+                            selected_year = None
+                            selected_month_num = None
+
+                            try:
+                                if '-' in sm:
+                                    left, right = sm.split('-', 1)
+                                    left = left.strip(); right = right.strip()
+                                    if left.isdigit():
+                                        selected_year = int(left); month_part = right
+                                    elif right.isdigit():
+                                        selected_year = int(right); month_part = left
+                                    else:
+                                        month_part = sm.replace('-', ' ')
+                                        selected_year = vacation_start.year if vacation_start else datetime.now().year
+                                else:
+                                    if ' ' in sm:
+                                        a, b = sm.split(' ', 1)
+                                        a = a.strip(); b = b.strip()
+                                        if a.isdigit():
+                                            selected_year = int(a); month_part = b
+                                        elif b.isdigit():
+                                            selected_year = int(b); month_part = a
+                                        else:
+                                            month_part = sm
+                                            selected_year = vacation_start.year if vacation_start else datetime.now().year
+                                    else:
+                                        month_part = sm
+                                        selected_year = vacation_start.year if vacation_start else datetime.now().year
+
+                                mp = month_part.strip()
+                                if mp.isdigit():
+                                    selected_month_num = int(mp)
+                                else:
+                                    try:
+                                        selected_month_num = list(calendar.month_name).index(mp.capitalize())
+                                    except:
+                                        try:
+                                            selected_month_num = list(calendar.month_abbr).index(mp.capitalize()[:3])
+                                        except:
+                                            selected_month_num = vacation_start.month if vacation_start else datetime.now().month
+
+                                if not (1 <= int(selected_month_num) <= 12):
+                                    selected_month_num = vacation_start.month if vacation_start else datetime.now().month
+
+                                date_fmt = f"{int(selected_year)}-{int(selected_month_num):02d}-%d"
+
+                                def build_date(row):
+                                    try:
+                                        return pd.to_datetime(date_fmt.replace("%d", str(int(row["day"]))))
+                                    except:
+                                        return pd.NaT
+
+                                daily_df["date"] = daily_df.apply(build_date, axis=1)
+
+                            except Exception as e:
+                                st.error(f"Error parsing selected month '{selected_month}': {e}")
+                                now = datetime.now()
+                                fallback_fmt = f"{now.year}-{now.month:02d}-%d"
+                                daily_df["date"] = daily_df["day"].apply(lambda d: pd.to_datetime(fallback_fmt.replace("%d", str(int(d)))) if pd.notna(d) else pd.NaT)
                             
                             # Filter for days within the vacation period where status is P (Present) only
-                            # Exclude WO (Week Off) from the PIV filter
+                            # Explicitly exclude WO (Week Off), W/O, and OFF from the PIV filter
                             vacation_period_present = daily_df[
                                 (daily_df['date'] >= vacation_start) & 
                                 (daily_df['date'] <= vacation_end) & 
-                                (daily_df['status'].isin(['P'])) &
-                                (~daily_df['status'].isin(['WO', 'W/O', 'OFF']))
+                                (daily_df['status'] == 'P')
                             ]
                             
                             # Get employee IDs who were present during vacation
