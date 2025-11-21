@@ -125,16 +125,157 @@ if page == "🏠 Dashboard":
                 st.info("No data available for chart.")
 
         
+            # --- Filter Options ---
+            st.divider()
+            st.subheader("🔍 Filter Options")
+            
+            # Create columns for filter options
+            filter_col1, filter_col2 = st.columns(2)
+            
+            with filter_col1:
+                filter_type = st.selectbox(
+                    "Select Filter Type",
+                    ["All Records", "ABV/AAV (Absent Before/After Vacation)", "PIV (Present In Vacation)"],
+                    key="filter_type"
+                )
+            
+            # Check if there are any vacation dates in the database records for this month
+            vacation_info = payroll_coll.find_one({"month": selected_month, "vacation_start_date": {"$exists": True}}, {"vacation_start_date": 1, "vacation_end_date": 1})
+            if vacation_info and "vacation_start_date" in vacation_info and "vacation_end_date" in vacation_info:
+                # Parse the ISO format date strings back to date objects
+                import json
+                from datetime import date
+                try:
+                    vacation_start_date = datetime.fromisoformat(vacation_info["vacation_start_date"].replace("Z", "+00:00")).date()
+                    vacation_end_date = datetime.fromisoformat(vacation_info["vacation_end_date"].replace("Z", "+00:00")).date()
+                except:
+                    # Fallback: try different date formats
+                    vacation_start_date = vacation_info["vacation_start_date"]
+                    vacation_end_date = vacation_info["vacation_end_date"]
+            else:
+                # Try to get vacation dates from any record in the month
+                sample_record = payroll_coll.find_one({"month": selected_month, "vacation_start_date": {"$exists": True}})
+                if sample_record:
+                    # Check if vacation dates exist in the record
+                    vacation_start_str = sample_record.get("vacation_start_date")
+                    vacation_end_str = sample_record.get("vacation_end_date")
+                    if vacation_start_str and vacation_end_str:
+                        try:
+                            vacation_start_date = datetime.fromisoformat(vacation_start_str.replace("Z", "+00:00")).date()
+                            vacation_end_date = datetime.fromisoformat(vacation_end_str.replace("Z", "+00:00")).date()
+                        except:
+                            vacation_start_date = vacation_start_str
+                            vacation_end_date = vacation_end_str
+                else:
+                    vacation_start_date = None
+                    vacation_end_date = None
+            
+            with filter_col2:
+                if filter_type != "All Records":
+                    if vacation_start_date and vacation_end_date:
+                        st.info(f"Using vacation period: {vacation_start_date} to {vacation_end_date}")
+                    else:
+                        st.warning("No vacation period specified. Please upload attendance with vacation dates to use these filters.")
+            
             # --- Data Table ---
             st.divider()
             st.subheader("📋 Payroll Data Table")
+
+            # Apply filters based on selection
+            df_display = df.copy()
+            
+            if filter_type == "ABV/AAV (Absent Before/After Vacation)":
+                if vacation_start_date and vacation_end_date:
+                    # Find employees who were absent before or after the vacation period
+                    try:
+                        # Convert to datetime for comparison
+                        vacation_start = pd.to_datetime(vacation_start_date)
+                        vacation_end = pd.to_datetime(vacation_end_date)
+                        
+                        # Get daily attendance records from the database
+                        daily_attendance = list(db.attendance_daily.find({
+                            "month": selected_month
+                        }))
+                        
+                        daily_df = pd.DataFrame(daily_attendance)
+                        
+                        if not daily_df.empty:
+                            # Convert day to datetime for comparison
+                            daily_df['date'] = daily_df.apply(
+                                lambda row: pd.to_datetime(f"{vacation_start.year}-{vacation_start.month}-{row['day']}"), axis=1
+                            )
+                            
+                            # Find employees absent before vacation (day before vacation start)
+                            day_before_vacation = vacation_start - pd.Timedelta(days=1)
+                            day_after_vacation = vacation_end + pd.Timedelta(days=1)
+                            
+                            # Filter for days before and after vacation
+                            before_vacation_records = daily_df[
+                                (daily_df['date'] == day_before_vacation) & 
+                                (daily_df['status'].isin(['A', 'ABSENT']))
+                            ]
+                            
+                            after_vacation_records = daily_df[
+                                (daily_df['date'] == day_after_vacation) & 
+                                (daily_df['status'].isin(['A', 'ABSENT']))
+                            ]
+                            
+                            # Get employee IDs who were absent before or after vacation
+                            absent_employees = set()
+                            absent_employees.update(before_vacation_records['employee_id'].tolist())
+                            absent_employees.update(after_vacation_records['employee_id'].tolist())
+                            
+                            # Filter the main dataframe to show only these employees
+                            df_display = df[df['employee_id'].isin(list(absent_employees))]
+                            
+                    except Exception as e:
+                        st.error(f"Error applying ABV/AAV filter: {e}")
+                        
+            elif filter_type == "PIV (Present In Vacation)":
+                if vacation_start_date and vacation_end_date:
+                    # Find employees who were present during the vacation period
+                    try:
+                        # Convert to datetime for comparison
+                        vacation_start = pd.to_datetime(vacation_start_date)
+                        vacation_end = pd.to_datetime(vacation_end_date)
+                        
+                        # Get daily attendance records from the database
+                        daily_attendance = list(db.attendance_daily.find({
+                            "month": selected_month
+                        }))
+                        
+                        daily_df = pd.DataFrame(daily_attendance)
+                        
+                        if not daily_df.empty:
+                            # Convert day to datetime for comparison
+                            daily_df['date'] = daily_df.apply(
+                                lambda row: pd.to_datetime(f"{vacation_start.year}-{vacation_start.month}-{row['day']}"), axis=1
+                            )
+                            
+                            # Filter for days within the vacation period where status is P (Present) only
+                            # Exclude WO (Week Off) from the PIV filter
+                            vacation_period_present = daily_df[
+                                (daily_df['date'] >= vacation_start) & 
+                                (daily_df['date'] <= vacation_end) & 
+                                (daily_df['status'].isin(['P'])) &
+                                (~daily_df['status'].isin(['WO', 'W/O', 'OFF']))
+                            ]
+                            
+                            # Get employee IDs who were present during vacation
+                            present_employees = set(vacation_period_present['employee_id'].tolist())
+                            
+                            # Filter the main dataframe to show only these employees
+                            df_display = df[df['employee_id'].isin(list(present_employees))]
+                            
+                    except Exception as e:
+                        st.error(f"Error applying PIV filter: {e}")
 
             display_cols = [
                 "employee_id", "employee_name", "department", "month",
                 "present_days", "half_days", "leaves", "week_offs", "absent_days",
                 "total_working_days", "full_month_status", "shift_type", "shift_in", "shift_out"
             ]
-            df_display = df[display_cols] if all(c in df.columns for c in display_cols) else df
+            df_display = df_display[display_cols] if all(c in df_display.columns for c in display_cols) else df_display
             st.dataframe(df_display, use_container_width=True)
 
             # --- Export Excel ---
@@ -328,6 +469,18 @@ elif page == "📤 Upload Monthly Attendance":
         key="attendance_upload"
     )
 
+    # Add vacation checkbox functionality
+    vacation_checkbox = st.checkbox("🏖️ Include Vacation Days")
+    vacation_start_date = None
+    vacation_end_date = None
+    
+    if vacation_checkbox:
+        col1, col2 = st.columns(2)
+        with col1:
+            vacation_start_date = st.date_input("Start Date", value=None, key="vacation_start")
+        with col2:
+            vacation_end_date = st.date_input("End Date", value=None, key="vacation_end")
+    
     # --- Process Payroll Button ---
     if st.button("🧮 Process Payroll"):
         if not timetable_file or not attendance_file:
@@ -349,7 +502,7 @@ elif page == "📤 Upload Monthly Attendance":
                         f.write(attendance_file.read())
 
                     # Process the payroll with both files
-                    result = compute_monthly_payroll(attendance_path, timetable_path)
+                    result = compute_monthly_payroll(attendance_path, timetable_path, vacation_start_date, vacation_end_date)
 
                     st.success(f"✅ Payroll computed successfully for {result['processed']} employees!")
                     st.info("📊 Check the Dashboard page for results.")
@@ -385,7 +538,7 @@ elif page == "👥 Employee Management":
         Uploads master shift details for employees.
         Expects an Excel file with columns: Employee_ID, Employee_Name, Department, Days, Shift_Type, Shift_In, Shift_Out, Crosses_Midnight, Shift_Duration_Hours, Weekoff
         """
-        df = pd.read_excel(file)
+        df = pd.read_excel(file, engine='openpyxl' if file.name.endswith('.xlsx') else 'xlrd')
         df = df.fillna("")
 
         # Group by Employee_ID to handle multiple rows per employee (one per day/shift type)
@@ -407,55 +560,92 @@ elif page == "👥 Employee Management":
                     "weekoff": row["Weekoff"]
                 })
 
-            # Store the weekly shift data for this employee in MongoDB
-            db.weekly_shifts.update_one(
+            # Store the weekly shift data for this employee in MongoDB - REPLACE existing data
+            db.weekly_shifts.replace_one(
                 {"employee_id": str(emp_id)},
                 {
-                    "$set": {
-                        "employee_id": str(emp_id),
-                        "employee_name": emp_name,
-                        "department": dept,
-                        "week_data": week_data,
-                        "uploaded_at": datetime.utcnow()
-                    }
+                    "employee_id": str(emp_id),
+                    "employee_name": emp_name,
+                    "department": dept,
+                    "week_data": week_data,
+                    "uploaded_at": datetime.utcnow()
                 },
                 upsert=True
             )
 
         return True
 
-    def add_employee(emp_id, name, department):
-        """Add a new employee to MongoDB"""
-        # Check if employee already exists
-        existing_employee = db.employees.find_one({"employee_id": emp_id})
-        if existing_employee:
-            return False, "Employee ID already exists"
-        
-        # Insert new employee
+    def add_or_update_employee_weekly_shifts(emp_id, name, department, week_data):
+        """Add or update an employee's weekly shifts in MongoDB weekly_shifts collection"""
+        # Prepare the document to insert/update
         employee_doc = {
-            "employee_id": emp_id,
-            "name": name,
+            "employee_id": str(emp_id),
+            "employee_name": name,
             "department": department,
+            "week_data": week_data,
             "updated_at": datetime.utcnow().isoformat()
         }
         
-        result = db.employees.insert_one(employee_doc)
-        return True, "Employee added successfully"
+        # Use upsert=True to insert if doesn't exist or update if exists
+        result = db.weekly_shifts.update_one(
+            {"employee_id": str(emp_id)},
+            {"$set": employee_doc},
+            upsert=True
+        )
+        
+        if result.upserted_id or result.modified_count > 0:
+            return True, "Employee weekly shifts added/updated successfully"
+        else:
+            return False, "No changes made to employee data"
 
-    def delete_employee(emp_id):
-        """Delete an employee from MongoDB"""
-        result = db.employees.delete_one({"employee_id": emp_id})
+    def delete_employee_weekly_shifts(emp_id):
+        """Delete an employee from weekly_shifts collection in MongoDB"""
+        result = db.weekly_shifts.delete_one({"employee_id": str(emp_id)})
         
         if result.deleted_count > 0:
-            # Also delete from MongoDB if needed
-            db.weekly_shifts.delete_one({"employee_id": str(emp_id)})
-            return True, "Employee deleted successfully"
+            # Also delete from employees collection if needed
+            db.employees.delete_one({"employee_id": str(emp_id)})
+            return True, "Employee deleted successfully from weekly_shifts collection"
         else:
-            return False, "Employee not found"
+            return False, "Employee not found in weekly_shifts collection"
+
+    def add_employee_weekly_shifts(emp_id, name, department, week_data=None):
+        """Add a new employee with weekly shifts to MongoDB weekly_shifts collection"""
+        # Prepare the document to insert/update
+        employee_doc = {
+            "employee_id": str(emp_id),
+            "employee_name": name,
+            "department": department,
+            "week_data": week_data or [],
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        # Use upsert=True to insert if doesn't exist or update if exists
+        result = db.weekly_shifts.update_one(
+            {"employee_id": str(emp_id)},
+            {"$set": employee_doc},
+            upsert=True
+        )
+        
+        if result.upserted_id or result.modified_count > 0:
+            return True, "Employee added/updated successfully in weekly_shifts collection"
+        else:
+            return False, "No changes made to employee data"
+
+    def delete_employee_weekly_shifts_only(emp_id):
+        """Delete an employee from weekly_shifts collection in MongoDB"""
+        result = db.weekly_shifts.delete_one({"employee_id": str(emp_id)})
+        
+        if result.deleted_count > 0:
+            # Also delete from employees collection if needed
+            db.employees.delete_one({"employee_id": str(emp_id)})
+            return True, "Employee deleted successfully from weekly_shifts collection"
+        else:
+            return False, "Employee not found in weekly_shifts collection"
 
     def get_all_employees():
-        """Get all employees from MongoDB"""
-        employees = list(db.employees.find({}))
+        """Get all employees from weekly_shifts collection"""
+        employees = list(db.weekly_shifts.find({}))
         return employees
 
     # Create tabs for different functionalities
@@ -467,41 +657,65 @@ elif page == "👥 Employee Management":
         new_name = st.text_input("Employee Name", key="new_name_2")
         new_dept = st.text_input("Department", key="new_dept_2")
         
+        # Add fields for weekly shift data
+        st.subheader("Weekly Shift Details")
+        day = st.selectbox("Day", ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], key="day_2")
+        shift_type = st.text_input("Shift Type", key="shift_type_2")
+        shift_in = st.text_input("Shift In (HH:MM)", key="shift_in_2")
+        shift_out = st.text_input("Shift Out (HH:MM)", key="shift_out_2")
+        crosses_midnight = st.checkbox("Crosses Midnight", key="crosses_midnight_2")
+        shift_duration = st.number_input("Shift Duration (Hours)", key="shift_duration_2", min_value=0.0, step=0.5)
+        weekoff = st.checkbox("Week Off", key="weekoff_2")
+        
         if st.button("Add Employee", key="add_employee_2"):
             if new_emp_id and new_name and new_dept:
-                success, message = add_employee(new_emp_id, new_name, new_dept)
+                # Create week_data from the input fields
+                week_data = [{
+                    "day": day,
+                    "shift_type": shift_type,
+                    "shift_in": shift_in,
+                    "shift_out": shift_out,
+                    "crosses_midnight": crosses_midnight,
+                    "shift_duration_hours": shift_duration,
+                    "weekoff": weekoff
+                }]
+                
+                success, message = add_employee_weekly_shifts(new_emp_id, new_name, new_dept, week_data)
                 if success:
                     st.success(message)
                 else:
                     st.error(message)
             else:
-                st.error("Please fill in all fields")
+                st.error("Please fill in all required fields (Employee ID, Name, Department)")
 
     with tab2:
         st.header("Delete Employee")
         all_employees = get_all_employees()
-        emp_options = {f"{emp['employee_id']} - {emp['name']}": emp['employee_id'] for emp in all_employees}
-        
-        selected_emp = st.selectbox("Select Employee to Delete", options=[""] + list(emp_options.keys()), key="delete_emp_select_2")
-        
-        if selected_emp:
-            emp_to_delete = emp_options[selected_emp]
-            confirm_delete = st.checkbox("⚠️ Confirm delete this employee permanently", key="confirm_delete_2")
+        if all_employees:
+            emp_options = {f"{emp.get('employee_name', emp.get('Employee_Name', 'Unknown'))} (ID: {emp.get('employee_id', emp.get('Employee_ID', 'Unknown'))})": emp.get('employee_id', emp.get('Employee_ID', '')) for emp in all_employees}
             
-            if st.button("Delete Employee", key="delete_employee_btn_2"):
-                if confirm_delete:
-                    success, message = delete_employee(emp_to_delete)
-                    if success:
-                        st.success(message)
-                        st.rerun()
+            selected_emp = st.selectbox("Select Employee to Delete", options=[""] + list(emp_options.keys()), key="delete_emp_select_2")
+            
+            if selected_emp:
+                emp_to_delete = emp_options[selected_emp]
+                confirm_delete = st.checkbox("⚠️ Confirm delete this employee permanently", key="confirm_delete_2")
+                
+                if st.button("Delete Employee", key="delete_employee_btn_2"):
+                    if confirm_delete:
+                        success, message = delete_employee_weekly_shifts_only(emp_to_delete)
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
                     else:
-                        st.error(message)
-                else:
-                    st.warning("Please confirm before deleting an employee.")
+                        st.warning("Please confirm before deleting an employee.")
+        else:
+            st.info("No employees available to delete.")
 
     with tab3:
         st.header("Upload Master Shift Details")
-        uploaded_file = st.file_uploader("Upload Staff Shift Excel File", type=["xlsx"])
+        uploaded_file = st.file_uploader("Upload Staff Shift Excel File", type=["xlsx","xls"])
 
         if st.button("Upload and Store Weekly Shifts", key="upload_shifts_2"):
             if not uploaded_file:
@@ -516,8 +730,47 @@ elif page == "👥 Employee Management":
     # Display all employees
     st.divider()
     st.header("📋 All Employees")
-    employees_df = pd.DataFrame(get_all_employees())
-    if not employees_df.empty:
+    employees = get_all_employees()
+    if employees:
+        # Create a DataFrame with only the required columns
+        df_data = []
+        for emp in employees:
+            # Create a row with only required fields
+            row = {
+                'Employee_ID': emp.get('employee_id', 'N/A'),
+                'Employee_Name': emp.get('employee_name', 'N/A'),
+                'Department': emp.get('department', 'N/A'),
+                'Expected_hours': emp.get('expected_hours', 'N/A')  # This might not exist in current data
+            }
+            
+            # Initialize day-specific shift in/out columns with default values
+            days_of_week = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            for day in days_of_week:
+                day_lower = day.lower()
+                row[f"{day_lower}_in"] = "N/A"
+                row[f"{day_lower}_out"] = "N/A"
+            
+            # Add week_data as separate shift in/out columns for each day
+            week_data = emp.get('week_data', [])
+            for day_data in week_data:
+                if isinstance(day_data, dict):
+                    day_name = day_data.get('day', 'Unknown')
+                    day_lower = day_name.lower() if day_name != 'Unknown' else 'unknown'
+                    if day_lower.capitalize() in days_of_week:
+                        row[f"{day_lower}_in"] = day_data.get('shift_in', 'N/A')
+                        row[f"{day_lower}_out"] = day_data.get('shift_out', 'N/A')
+            
+            df_data.append(row)
+        
+        employees_df = pd.DataFrame(df_data)
+        
+        # Display the DataFrame with only required columns
         st.dataframe(employees_df, use_container_width=True)
+        
+        # Also provide an option to see the raw data in JSON format
+        if st.checkbox("Show raw employee data in JSON format"):
+            for emp in employees:
+                with st.expander(f"Employee: {emp.get('employee_name', 'N/A')} (ID: {emp.get('employee_id', 'N/A')})"):
+                    st.json(emp)
     else:
         st.info("No employees found in database.")

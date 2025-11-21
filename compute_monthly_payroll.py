@@ -1,7 +1,7 @@
 """
 compute_monthly_payroll.py
 ------------------------------------
-Final version for MVA Payroll System.
+Final version for MVA Payroll System (Updated with ABSENT logic Option A).
 
 ✅ Reads only monthly attendance Excel file.
 ✅ Fetches shift details from MongoDB weekly_shifts collection.
@@ -9,23 +9,57 @@ Final version for MVA Payroll System.
 ✅ Computes presence, absences, FM status automatically.
 ✅ Implements new deduction rules:
     - Compare actual IN/OUT with expected IN/OUT
-    - If hours worked < 9 hours, apply deductions
+    - If hours worked < expected, apply deductions
     - Late arrival rules (6+ min for 3 days, 30+ min any day)
     - Half-day marking
 ✅ Updates payroll summary in MongoDB.
+
+ABSENT logic (Option A):
+- If status == "A" or "ABSENT" -> absent (always)
+- If punches are "--" or "--:--", check status; only count absent when status == "A"/"ABSENT"
+- If punches exist and status == "A" -> still absent
 """
 
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, date
+import calendar
 from mva import parse_mva_blocks, calculate_fm_status
 from pymongo import MongoClient
+
+
+def extract_year_month_from_label(month_label):
+    """
+    Extract year and month number from a month label like 'November-2024'
+    Returns tuple (year, month_num) 
+    """
+    import re
+    year = None
+    month_num = None
+    
+    if month_label:
+        # Try to extract year from month string like "November-2024"
+        year_match = re.search(r'(\d{4})', month_label)
+        if year_match:
+            year = int(year_match.group(1))
+            month_name_match = re.search(r'([A-Za-z]+)', month_label)
+            if month_name_match:
+                month_name = month_name_match.group(1)
+                # Get month number from month name
+                month_num = list(calendar.month_name).index(month_name.title())
+    
+    # If we couldn't parse the month/year from the string, use current date
+    if year is None or month_num is None:
+        year = datetime.now().year
+        month_num = datetime.now().month
+    
+    return year, month_num
 
 
 AUTO_UPDATE_EMPLOYEES = False   # Automatically update employee info
 SYNC_EMPLOYEES = False         # Set True to remove employees missing in this import
 
 
-def compute_monthly_payroll(attendance_file, timetable_file=None):
+def compute_monthly_payroll(attendance_file, timetable_file=None, vacation_start_date=None, vacation_end_date=None):
     print(f"📘 Loading attendance file: {attendance_file}")
     if timetable_file:
         print(f"📘 Loading timetable file: {timetable_file}")
@@ -83,50 +117,42 @@ def compute_monthly_payroll(attendance_file, timetable_file=None):
                             date_cols.append((col_idx, day_num))
             
             # Process each employee's data in the timetable
-            emp_start_idx = 0
             for idx, row in timetable_df.iterrows():
                 empcode_cell = str(row.iloc[1]).strip() if len(row) > 1 else ""  # Column B (index 1) has employee code
-                if "EMPCODE" in empcode_cell.upper() or len(empcode_cell) > 0:
-                    # Check if this looks like an employee header row
-                    if any("EMPCODE" in str(cell).upper() for cell in row) or len(empcode_cell) > 0:
-                        # Get employee ID and name from this block
-                        emp_id = ""
-                        emp_name = ""
-                        
-                        # Look for the row with the actual employee code and name
-                        if "EMPCODE" in empcode_cell.upper():
-                            # This is the header row, actual values are in the next row
-                            if idx + 1 < len(timetable_df):
-                                next_row = timetable_df.iloc[idx + 1]
-                                emp_id = str(next_row.iloc[1]).strip() if len(next_row) > 1 else ""
-                                emp_name = str(next_row.iloc[4]).strip() if len(next_row) > 4 else ""
+                # Consider both header rows with "EMPCODE" and direct rows with empcode value
+                if empcode_cell and empcode_cell.upper() != "NAN":
+                    # Skip rows that are clearly not employee rows
+                    if "EMPCODE" in empcode_cell.upper():
+                        # header row, values likely in next row
+                        if idx + 1 < len(timetable_df):
+                            next_row = timetable_df.iloc[idx + 1]
+                            emp_id = str(next_row.iloc[1]).strip() if len(next_row) > 1 else ""
                         else:
-                            # This row has the actual values
-                            emp_id = empcode_cell
-                            emp_name = str(row.iloc[4]).strip() if len(row) > 4 else ""
-                        
-                        if emp_id and emp_id != "EMPCODE":
-                            # Extract IN/OUT times for each day for this employee
-                            emp_timetable = {}
-                            for col_idx, day_num in date_cols:
-                                expected_in = ""
-                                expected_out = ""
-                                
-                                if in_row_idx is not None and col_idx < len(timetable_df.columns):
-                                    expected_in_val = timetable_df.iloc[in_row_idx, col_idx]
-                                    expected_in = str(expected_in_val).strip() if pd.notna(expected_in_val) else ""
-                                
-                                if out_row_idx is not None and col_idx < len(timetable_df.columns):
-                                    expected_out_val = timetable_df.iloc[out_row_idx, col_idx]
-                                    expected_out = str(expected_out_val).strip() if pd.notna(expected_out_val) else ""
-                                
-                                # Store expected times for this day
-                                emp_timetable[day_num] = {
-                                    "expected_in": expected_in,
-                                    "expected_out": expected_out
-                                }
+                            emp_id = ""
+                    else:
+                        emp_id = empcode_cell
+
+                    if emp_id and emp_id.upper() != "EMPCODE":
+                        emp_timetable = {}
+                        for col_idx, day_num in date_cols:
+                            expected_in = ""
+                            expected_out = ""
                             
-                            timetable_data[emp_id] = emp_timetable
+                            if in_row_idx is not None and col_idx < len(timetable_df.columns):
+                                expected_in_val = timetable_df.iloc[in_row_idx, col_idx]
+                                expected_in = str(expected_in_val).strip() if pd.notna(expected_in_val) else ""
+                            
+                            if out_row_idx is not None and col_idx < len(timetable_df.columns):
+                                expected_out_val = timetable_df.iloc[out_row_idx, col_idx]
+                                expected_out = str(expected_out_val).strip() if pd.notna(expected_out_val) else ""
+                            
+                            # Store expected times for this day
+                            emp_timetable[day_num] = {
+                                "expected_in": expected_in,
+                                "expected_out": expected_out
+                            }
+                        
+                        timetable_data[emp_id] = emp_timetable
         except Exception as e:
             print(f"⚠️ Error reading timetable file: {e}")
 
@@ -144,16 +170,45 @@ def compute_monthly_payroll(attendance_file, timetable_file=None):
         # Get expected shift times from the uploaded timetable if available
         expected_shifts = timetable_data.get(emp_id, {})
 
-        # --- Attendance metrics ---
+        # --- Attendance metrics (updated absent logic Option A) ---
         daily = b.get("daily", [])
-        statuses = [d.get("status", "").strip().upper() for d in daily if d.get("day")]
 
+        # Build statuses list for calculating present/half/leave/weekoff/total days
+        statuses = []
+        for d in daily:
+            if d.get("day"):
+                statuses.append((d.get("status") or "").strip().upper())
+
+        # Present / half / leave / weekoffs / total working days (from statuses)
         present_days = sum(1 for s in statuses if s in ("P", "PR", "W", "WD"))
         half_days = sum(1 for s in statuses if s in ("HD", "H", "1/2"))
         leaves = sum(1 for s in statuses if s in ("L", "LV", "LEAVE"))
         week_offs = sum(1 for s in statuses if s in ("WO", "W/O", "OFF"))
-        absents = sum(1 for s in statuses if s in ("A", "AB", "ABSENT"))
         total_working_days = len(statuses)
+
+        # Updated absent logic (Option A)
+        absents = 0
+        for d in daily:
+            if not d.get("day"):
+                continue
+            status = (d.get("status") or "").strip().upper()
+            in_time = (d.get("in_time") or "").strip()
+            out_time = (d.get("out_time") or "").strip()
+
+            # If status explicitly marks absent, always count as absent (Option A)
+            if status in ("A", "ABSENT"):
+                absents += 1
+                continue
+
+            # If punches are missing ("--" or "--:--"), check status
+            if in_time in ("--", "--:--") or out_time in ("--", "--:--"):
+                # status already checked above; only count if it was "A"
+                # (we've already covered that case). So do nothing here.
+                continue
+
+            # Otherwise, not absent (status not A and punches exist)
+            # (Option A requires no additional action)
+
 
         # --- Payroll Deduction Rules ---
         total_quarter_cut_days = 0  # ¼-day salary cuts
@@ -161,9 +216,9 @@ def compute_monthly_payroll(attendance_file, timetable_file=None):
 
         for day_data in daily:
             day_num = day_data.get("day")
-            in_time = day_data.get("in_time", "").strip()
-            out_time = day_data.get("out_time", "").strip()
-            status = (day_data.get("status", "") or "").strip().upper()
+            in_time = (day_data.get("in_time") or "").strip()
+            out_time = (day_data.get("out_time") or "").strip()
+            status = (day_data.get("status") or "").strip().upper()
 
             if not in_time or not out_time or status not in ("P", "PR", "W", "WD"):
                 continue
@@ -269,6 +324,11 @@ def compute_monthly_payroll(attendance_file, timetable_file=None):
             "shift_out": expected_out,
             "computed_at": datetime.utcnow().isoformat()
         }
+        
+        # Add vacation dates to the document if they were provided
+        if vacation_start_date and vacation_end_date:
+            doc["vacation_start_date"] = vacation_start_date.isoformat()
+            doc["vacation_end_date"] = vacation_end_date.isoformat()
 
         # Insert or update the document in MongoDB
         payroll_collection.replace_one(
@@ -335,6 +395,9 @@ if __name__ == "__main__":
     import glob
     import os
     list_of_files = glob.glob('attendance_*.xlsx') # * means all if need specific format then *.xlsx
-    latest_file = max(list_of_files, key=os.path.getctime)
-    print(f"Processing latest attendance file: {latest_file}")
-    compute_monthly_payroll(latest_file)
+    if not list_of_files:
+        print("No attendance_*.xlsx files found in current directory.")
+    else:
+        latest_file = max(list_of_files, key=os.path.getctime)
+        print(f"Processing latest attendance file: {latest_file}")
+        compute_monthly_payroll(latest_file)
